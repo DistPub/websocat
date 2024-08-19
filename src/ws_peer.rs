@@ -312,16 +312,16 @@ impl<T: WsStream + 'static> Read for WsReadWrapper<T> {
                                     match ignorer.poll() {
                                         Err(_) => error!("ignore ping timeout error"),
                                         Ok(Async::NotReady) => {
-                                            warn!("Closing WebSocket connection due to ping timeout");
+                                            warn!("Closing WebSocket connection due to ping timeout with ignorer");
                                             return abort_and_broken_pipe!();
                                         },
                                         Ok(Async::Ready(_inst)) => {
-                                            debug!("ignore ping timeout");
+                                            debug!("ignore ping timeout check due to not sended ping request");
                                             de.reset(::std::time::Instant::now() + *intvl);
                                         }
                                     }
                                 } else {
-                                    warn!("Closing WebSocket connection due to ping timeout");
+                                    warn!("Closing WebSocket connection due to ping timeout w/o ignorer");
                                     return abort_and_broken_pipe!();
                                 }
                             }
@@ -596,6 +596,7 @@ impl<T: WsStream + 'static> ::futures::Future for WsPinger<T> {
                     match self.si.borrow_mut().sink.start_send(om) {
                         Err(e) => info!("wsping: {}", e),
                         Ok(AsyncSink::NotReady(_om)) => {
+                            debug!("ignore send websocket ping due to channel contention");
                             let _ = self.ignore_check.clone().send(());
                             self.st = WaitingForTimer;
                             continue;
