@@ -597,7 +597,7 @@ impl<T: WsStream + 'static> ::futures::Future for WsPinger<T> {
                         Err(e) => info!("wsping: {}", e),
                         Ok(AsyncSink::NotReady(_om)) => {
                             debug!("ignore send websocket ping due to channel contention");
-                            let _ = self.ignore_check.clone().send(());
+                            let _ = self.ignore_check.start_send(());
                             self.st = WaitingForTimer;
                             continue;
                         }
@@ -651,7 +651,7 @@ pub fn finish_building_ws_peer<S>(opts: &super::Options, duplex: Duplex<S>, clos
         let (tx_ignore, rx_ignore) = ::futures::unsync::mpsc::unbounded();
 
         let intv = ::std::time::Duration::from_secs(d);
-        let pinger = super::ws_peer::WsPinger::new(mpsink.clone(), intv,now, rx, tx_ignore.clone(), opts.max_sent_pings);
+        let pinger = super::ws_peer::WsPinger::new(mpsink.clone(), intv,now, rx, tx_ignore, opts.max_sent_pings);
         ::tokio_current_thread::spawn(pinger);
         (Some(tx), Some(rx_ignore))
     } else {
