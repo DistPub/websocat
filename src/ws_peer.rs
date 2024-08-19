@@ -156,6 +156,7 @@ pub struct WsReadWrapper<T: WsStream + 'static> {
     pub debt: ReadDebt,
     pub pong_timeout: Option<(::tokio_timer::Delay, ::std::time::Duration)>,
     pub ping_aborter: Option<::futures::unsync::oneshot::Sender<()>>,
+    pub pong_timeout_ignorer: Option<::futures::unsync::mpsc::UnboundedReceiver<()>>,
 
     pub text_prefix: Option<String>,
     pub binary_prefix: Option<String>,
@@ -302,13 +303,27 @@ impl<T: WsStream + 'static> Read for WsReadWrapper<T> {
                 NotReady => {
                     use futures::Async;
                     use futures::Future;
-                    if let Some((de, _intvl)) = self.pong_timeout.as_mut() {
+                    if let Some((de, intvl)) = self.pong_timeout.as_mut() {
                         match de.poll() {
                             Err(e) => error!("tokio-timer's Delay: {}", e),
                             Ok(Async::NotReady) => (),
                             Ok(Async::Ready(_inst)) => {
-                                warn!("Closing WebSocket connection due to ping timeout");
-                                return abort_and_broken_pipe!();
+                                if let Some(mut ignorer) = self.pong_timeout_ignorer.take() {
+                                    match ignorer.poll() {
+                                        Err(_) => error!("ignore ping timeout error"),
+                                        Ok(Async::NotReady) => {
+                                            warn!("Closing WebSocket connection due to ping timeout");
+                                            return abort_and_broken_pipe!();
+                                        },
+                                        Ok(Async::Ready(_inst)) => {
+                                            debug!("ignore ping timeout");
+                                            de.reset(::std::time::Instant::now() + *intvl);
+                                        }
+                                    }
+                                } else {
+                                    warn!("Closing WebSocket connection due to ping timeout");
+                                    return abort_and_broken_pipe!();
+                                }
                             }
                         }
                     }
@@ -509,6 +524,7 @@ pub struct WsPinger<T: WsStream + 'static> {
     t: ::tokio_timer::Interval,
     origin: ::std::time::Instant,
     aborter: ::futures::unsync::oneshot::Receiver<()>,
+    ignore_check: ::futures::unsync::mpsc::UnboundedSender<()>,
     max_sent_pings: Option<usize>,
 }
 
@@ -518,6 +534,7 @@ impl<T: WsStream + 'static> WsPinger<T> {
         interval: ::std::time::Duration,
         origin: ::std::time::Instant,
         aborter: ::futures::unsync::oneshot::Receiver<()>,
+        ignore_check: ::futures::unsync::mpsc::UnboundedSender<()>,
         max_sent_pings: Option<usize>,
     ) -> Self {
         WsPinger {
@@ -526,6 +543,7 @@ impl<T: WsStream + 'static> WsPinger<T> {
             si: sink,
             origin,
             aborter,
+            ignore_check,
             max_sent_pings,
         }
     }
@@ -578,7 +596,9 @@ impl<T: WsStream + 'static> ::futures::Future for WsPinger<T> {
                     match self.si.borrow_mut().sink.start_send(om) {
                         Err(e) => info!("wsping: {}", e),
                         Ok(AsyncSink::NotReady(_om)) => {
-                            return Ok(Async::NotReady);
+                            let _ = self.ignore_check.clone().send(());
+                            self.st = WaitingForTimer;
+                            continue;
                         }
                         Ok(AsyncSink::Ready) => {
                             self.st = PollComplete;
@@ -589,7 +609,8 @@ impl<T: WsStream + 'static> ::futures::Future for WsPinger<T> {
                 PollComplete => match self.si.borrow_mut().sink.poll_complete() {
                     Err(e) => info!("wsping: {}", e),
                     Ok(Async::NotReady) => {
-                        return Ok(Async::NotReady);
+                        self.st = WaitingForTimer;
+                        continue;
                     }
                     Ok(Async::Ready(())) => {
                         self.st = WaitingForTimer;
@@ -622,17 +643,18 @@ pub fn finish_building_ws_peer<S>(opts: &super::Options, duplex: Duplex<S>, clos
     };
 
     let now = ::std::time::Instant::now();
-    let ping_aborter = if let Some(d) = opts.ws_ping_interval {
+    let (ping_aborter, pong_timeout_ignorer) = if let Some(d) = opts.ws_ping_interval {
         debug!("Starting pinger");
 
         let (tx, rx) = ::futures::unsync::oneshot::channel();
+        let (tx_ignore, rx_ignore) = ::futures::unsync::mpsc::unbounded();
 
         let intv = ::std::time::Duration::from_secs(d);
-        let pinger = super::ws_peer::WsPinger::new(mpsink.clone(), intv,now, rx, opts.max_sent_pings);
+        let pinger = super::ws_peer::WsPinger::new(mpsink.clone(), intv,now, rx, tx_ignore.clone(), opts.max_sent_pings);
         ::tokio_current_thread::spawn(pinger);
-        Some(tx)
+        (Some(tx), Some(rx_ignore))
     } else {
-        None
+        (None, None)
     };
 
     let pong_timeout = if let Some(d) = opts.ws_ping_timeout {
@@ -677,6 +699,7 @@ pub fn finish_building_ws_peer<S>(opts: &super::Options, duplex: Duplex<S>, clos
         debt: super::readdebt::ReadDebt(Default::default(), opts.read_debt_handling, zmsgh),
         pong_timeout,
         ping_aborter,
+        pong_timeout_ignorer,
         text_prefix: opts.ws_text_prefix.clone(),
         binary_prefix: opts.ws_binary_prefix.clone(),
         binary_base64: opts.ws_binary_base64,
