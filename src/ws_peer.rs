@@ -318,6 +318,7 @@ impl<T: WsStream + 'static> Read for WsReadWrapper<T> {
                                         Ok(Async::Ready(_inst)) => {
                                             debug!("ignore ping timeout check due to not sended ping request");
                                             de.reset(::std::time::Instant::now() + *intvl);
+                                            self.pong_timeout_ignorer = Some(ignorer);
                                         }
                                     }
                                 } else {
